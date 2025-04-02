@@ -7,6 +7,7 @@ async fn main() -> anyhow::Result<()> {
     let storage = Arc::new(SQLiteStorage::new("eventbus.db")?);
     let storage = Some( storage);
     let ws_transport = WsTransport::new(storage);
-    ws_transport.serve("0.0.0.0:8080").await?;
+    let auto_ack = true;
+    ws_transport.serve("0.0.0.0:8080", auto_ack).await?;
     Ok(())
 }

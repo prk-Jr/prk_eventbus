@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use bytes::Bytes;
 use tokio::sync::Mutex;
 use rusqlite::{Connection, params};
 use crate::core::Message;
@@ -32,18 +33,34 @@ impl SQLiteStorage {
 #[async_trait]
 impl Storage for SQLiteStorage {
     async fn insert_message(&self, msg: &Message) -> Result<u64> {
+        self.insert_messages(&[msg.clone()]).await.map(|seqs| seqs[0])
+    }
+
+    async fn insert_messages(&self, messages: &[Message]) -> Result<Vec<u64>> {
         let conn = self.conn.clone();
-        let msg = msg.clone();
-        let seq = tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
-            conn.execute(
-                "INSERT INTO messages (topic, payload, metadata, status) VALUES (?, ?, ?, 'pending')",
-                params![msg.topic, msg.payload, serde_json::to_string(&msg.metadata)?],
-            )?;
-            Ok::<u64, anyhow::Error>(conn.last_insert_rowid() as u64)
+        let messages = messages.to_vec();
+        let seqs = tokio::task::spawn_blocking(move || {
+            let mut conn = conn.blocking_lock();
+            let mut seqs = Vec::new();
+            let tx = conn.transaction()?;
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO messages (topic, payload, metadata, status) VALUES (?, ?, ?, 'pending')",
+                )?;
+                for msg in &messages {
+                    stmt.execute(params![
+                        msg.topic,
+                        &msg.payload[..],
+                        serde_json::to_string(&msg.metadata)?,
+                    ])?;
+                    seqs.push(tx.last_insert_rowid() as u64);
+                }
+            }
+            tx.commit()?;
+            Ok::<Vec<u64>, anyhow::Error>(seqs)
         })
         .await??;
-        Ok(seq)
+        Ok(seqs)
     }
 
     async fn acknowledge_message(&self, seq: u64) -> Result<()> {
@@ -69,7 +86,7 @@ impl Storage for SQLiteStorage {
                 Ok(Message {
                     seq: row.get(0)?,
                     topic: row.get(1)?,
-                    payload: row.get(2)?,
+                    payload: Bytes::from(row.get::<_, Vec<u8>>(2)?),
                     metadata: serde_json::from_str(&row.get::<_, String>(3)?)
                         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
                 })

@@ -1,10 +1,11 @@
+use bytes::Bytes;
 use serde::{Serialize, Deserialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
-    pub seq: u64,           // Added for sequence-based persistence and replay
+    pub seq: u64,
     pub topic: String,
-    pub payload: Vec<u8>,
+    pub payload: Bytes, 
     pub metadata: Metadata,
 }
 

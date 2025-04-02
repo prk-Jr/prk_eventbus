@@ -23,9 +23,9 @@ impl<S: Storage + Send + Sync + 'static> WsTransport<S> {
         Self { storage }
     }
 
-    pub async fn serve(&self, addr: &str) -> anyhow::Result<()> {
+    pub async fn serve(&self, addr: &str, auto_ack: bool) -> anyhow::Result<()> {
         let storage = self.storage.clone();
-        let bus = Arc::new(EventBus::new(self.storage.clone()));
+        let bus = Arc::new(EventBus::new(self.storage.clone(), auto_ack));
         let app = Router::new().route("/ws", get({
             let storage = storage.clone();
             move |ws| Self::handle_ws(ws, bus.clone(), storage.clone())

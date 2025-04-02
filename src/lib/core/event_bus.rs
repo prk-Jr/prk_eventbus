@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use bytes::Bytes;
 use tokio::sync::{broadcast, RwLock};
-use crate::storage::{self, Storage};
+use crate::storage::Storage;
 use crate::core::{Message, Metadata};
 use chrono::Utc;
 
@@ -27,14 +28,16 @@ pub struct EventBus<S: Storage + Send + Sync + 'static> {
     pattern_trie: Arc<RwLock<PatternNode>>,
     storage: Option<Arc<S>>,
     next_seq: Arc<RwLock<u64>>,
+    auto_ack: bool,
 }
 
 impl <S: Storage + Send + Sync + 'static>  EventBus<S> {
-    pub fn new(storage: Option<Arc<S>>) -> Self {
+    pub fn new(storage: Option<Arc<S>>, auto_ack: bool) -> Self {
         Self {
             pattern_trie: Arc::new(RwLock::new(PatternNode::new())),
             storage,
             next_seq: Arc::new(RwLock::new(0)),
+            auto_ack
         }
     }
 
@@ -43,6 +46,8 @@ impl <S: Storage + Send + Sync + 'static>  EventBus<S> {
         let seq = *seq_guard;
         *seq_guard += 1;
         drop(seq_guard);
+
+        let payload = Bytes::copy_from_slice(&payload);
 
         let msg = Message {
             seq,
@@ -64,7 +69,55 @@ impl <S: Storage + Send + Sync + 'static>  EventBus<S> {
         let segments = topic.split('.').collect::<Vec<_>>();
         let matching_channels = Self::collect_channels(&trie, &segments);
         for tx in matching_channels {
-            let _ = tx.send(msg.clone());
+           if tx.send(msg.clone()).is_ok() {
+                if self.auto_ack {
+                    if let Some(storage) = &self.storage {
+                        storage.acknowledge_message(msg.seq).await?;
+                    }
+                }
+            };
+            
+        }
+        Ok(())
+    }
+
+    pub async fn publish_batch(&self, messages: Vec<(String, Vec<u8>)>) -> anyhow::Result<()> {
+        let mut seq_guard = self.next_seq.write().await;
+        let start_seq = *seq_guard;
+        *seq_guard += messages.len() as u64;
+        drop(seq_guard);
+    
+        let messages: Vec<Message> = messages
+            .into_iter()
+            .enumerate()
+            .map(|(i, (topic, payload))| Message {
+                seq: start_seq + i as u64,
+                topic,
+                payload:  Bytes::copy_from_slice(&payload),
+                metadata: Metadata {
+                    timestamp: Utc::now().timestamp(),
+                    content_type: "application/json".to_string(),
+                },
+            })
+            .collect();
+
+            if let Some(storage) = &self.storage {
+                storage.insert_messages(&messages).await?;
+            }
+    
+        let trie = self.pattern_trie.read().await;
+        for msg in messages {
+            let segments = msg.topic.split('.').collect::<Vec<_>>();
+            let matching_channels = Self::collect_channels(&trie, &segments);
+            for tx in matching_channels {
+                if tx.send(msg.clone()).is_ok() {
+                    if self.auto_ack {
+                        if let Some(storage) = &self.storage {
+                            storage.acknowledge_message(msg.seq).await?;
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     }
