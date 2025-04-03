@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use bytes::Bytes;
 use tokio::sync::{broadcast, RwLock};
+use uuid::Uuid;
 use crate::storage::Storage;
 use crate::core::{Message, Metadata};
 use chrono::Utc;
@@ -41,16 +42,25 @@ impl <S: Storage + Send + Sync + 'static>  EventBus<S> {
         }
     }
 
-    pub async fn publish(&self, topic: &str, payload: Vec<u8>) -> anyhow::Result<()> {
+    pub async fn acknowledge_message(&self, seq: u64, message_id: Uuid) -> anyhow::Result<()> {
+        if let Some(storage) = &self.storage {
+            storage.acknowledge_message(seq, message_id).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn publish(&self, topic: &str, payload: Vec<u8>, ttl: Option<i64>,) -> anyhow::Result<()> {
         let mut seq_guard = self.next_seq.write().await;
         let seq = *seq_guard;
         *seq_guard += 1;
         drop(seq_guard);
 
         let payload = Bytes::copy_from_slice(&payload);
+        let message_id = Uuid::new_v4(); // Generate unique message ID
 
         let msg = Message {
             seq,
+            message_id,
             topic: topic.to_string(),
             payload,
             metadata: Metadata {
@@ -61,7 +71,7 @@ impl <S: Storage + Send + Sync + 'static>  EventBus<S> {
 
         // Persist the message before publishing
         if let Some(storage) = &self.storage {
-            storage.insert_message(&msg).await?;
+            storage.insert_message(&msg, ttl).await?;
         }
 
         // Publish to all matching subscribers
@@ -71,9 +81,7 @@ impl <S: Storage + Send + Sync + 'static>  EventBus<S> {
         for tx in matching_channels {
            if tx.send(msg.clone()).is_ok() {
                 if self.auto_ack {
-                    if let Some(storage) = &self.storage {
-                        storage.acknowledge_message(msg.seq).await?;
-                    }
+                    self.acknowledge_message(msg.seq, message_id).await?;
                 }
             };
             
@@ -81,7 +89,7 @@ impl <S: Storage + Send + Sync + 'static>  EventBus<S> {
         Ok(())
     }
 
-    pub async fn publish_batch(&self, messages: Vec<(String, Vec<u8>)>) -> anyhow::Result<()> {
+    pub async fn publish_batch(&self, messages: Vec<(String, Vec<u8>)>, ttl: Option<i64>) -> anyhow::Result<()> {
         let mut seq_guard = self.next_seq.write().await;
         let start_seq = *seq_guard;
         *seq_guard += messages.len() as u64;
@@ -93,6 +101,7 @@ impl <S: Storage + Send + Sync + 'static>  EventBus<S> {
             .map(|(i, (topic, payload))| Message {
                 seq: start_seq + i as u64,
                 topic,
+                message_id: Uuid::new_v4(),
                 payload:  Bytes::copy_from_slice(&payload),
                 metadata: Metadata {
                     timestamp: Utc::now().timestamp(),
@@ -102,7 +111,7 @@ impl <S: Storage + Send + Sync + 'static>  EventBus<S> {
             .collect();
 
             if let Some(storage) = &self.storage {
-                storage.insert_messages(&messages).await?;
+                storage.insert_messages(&messages,ttl).await?;
             }
     
         let trie = self.pattern_trie.read().await;
@@ -112,9 +121,7 @@ impl <S: Storage + Send + Sync + 'static>  EventBus<S> {
             for tx in matching_channels {
                 if tx.send(msg.clone()).is_ok() {
                     if self.auto_ack {
-                        if let Some(storage) = &self.storage {
-                            storage.acknowledge_message(msg.seq).await?;
-                        }
+                        self.acknowledge_message(msg.seq, msg.message_id).await?;
                     }
                 }
             }
@@ -141,6 +148,8 @@ impl <S: Storage + Send + Sync + 'static>  EventBus<S> {
 
         rx
     }
+
+   
 
     fn add_subscriber(node: &mut PatternNode, segments: &[&str], tx: broadcast::Sender<Message>) {
         if segments.is_empty() {

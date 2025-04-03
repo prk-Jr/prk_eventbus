@@ -1,9 +1,11 @@
 use bytes::Bytes;
 use serde::{Serialize, Deserialize};
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub seq: u64,
+    pub message_id: Uuid,
     pub topic: String,
     pub payload: Bytes, 
     pub metadata: Metadata,

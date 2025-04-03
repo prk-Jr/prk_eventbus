@@ -4,10 +4,10 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let storage = Arc::new(SQLiteStorage::new("eventbus.db")?);
+    let storage = Arc::new(SQLiteStorage::new("eventbus.db", 100)?);
     let storage = Some( storage);
-    let ws_transport = WsTransport::new(storage);
     let auto_ack = true;
-    ws_transport.serve("0.0.0.0:8080", auto_ack).await?;
+    let ws_transport = WsTransport::new(storage, auto_ack);
+    ws_transport.serve("0.0.0.0:8080").await?;
     Ok(())
 }

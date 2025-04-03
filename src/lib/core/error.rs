@@ -2,10 +2,16 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum EventBusError {
-    #[error("Topic {0} not found")]
-    TopicNotFound(String),
+    #[error("WebSocket error: {0}")]
+    WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
     #[error("Serialization error: {0}")]
-    SerializationError(String),
+    Serialization(#[from] serde_json::Error),
     #[error("Storage error: {0}")]
-    StorageError(String),
+    Storage(#[from] anyhow::Error),
+    #[error("Connection failed: {0}")]
+    Connection(String),
+    #[error("Invalid message format")]
+    InvalidMessage,
+    #[error("Channel closed")]
+    ChannelClosed,
 }
