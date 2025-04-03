@@ -1,4 +1,5 @@
 use rust_eventbus::adapters::websocket::WsTransport;
+use rust_eventbus::adapters::WsConfig;
 use rust_eventbus::storage::sqlite::SQLiteStorage;
 use std::sync::Arc;
 
@@ -7,7 +8,7 @@ async fn main() -> anyhow::Result<()> {
     let storage = Arc::new(SQLiteStorage::new("eventbus.db", 100)?);
     let storage = Some( storage);
     let auto_ack = true;
-    let ws_transport = WsTransport::new(storage, auto_ack);
+    let ws_transport = WsTransport::new(storage, WsConfig { channel_capacity: 100, auto_ack });
     ws_transport.serve("0.0.0.0:8080").await?;
     Ok(())
 }

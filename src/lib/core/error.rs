@@ -1,3 +1,5 @@
+use std::io;
+
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -9,6 +11,8 @@ pub enum EventBusError {
     #[error("Storage error: {0}")]
     Storage(#[from] anyhow::Error),
     #[error("Connection failed: {0}")]
+    IoError(#[from] io::Error),
+    #[error("IO Error: {0}")]
     Connection(String),
     #[error("Invalid message format")]
     InvalidMessage,

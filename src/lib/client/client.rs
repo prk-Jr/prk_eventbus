@@ -2,29 +2,69 @@ use tokio_tungstenite::{connect_async, tungstenite::protocol::Message as WsMessa
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{self, json};
 use crate::core::Message as CoreMessage;
-use anyhow::{Result, Context};
+use crate::core::error::EventBusError;
 use tokio::net::TcpStream;
 use tokio_tungstenite::WebSocketStream;
 use uuid::Uuid;
+use std::time::Duration;
 
 type WsConnection = WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
+
+#[derive(Clone)]
+pub struct ClientConfig {
+    pub url: String,
+    pub reconnect_interval: Duration,
+    pub max_retries: usize,
+}
+
+impl Default for ClientConfig {
+    fn default() -> Self {
+        Self {
+            url: "ws://127.0.0.1:3000/ws".to_string(),
+            reconnect_interval: Duration::from_secs(5),
+            max_retries: 3,
+        }
+    }
+}
 
 pub struct EventBusClient {
     sender: futures_util::stream::SplitSink<WsConnection, WsMessage>,
     receiver: futures_util::stream::SplitStream<WsConnection>,
+    config: ClientConfig,
 }
 
 impl EventBusClient {
-    pub async fn connect(url: &str) -> Result<Self> {
-        let (ws_stream, _) = connect_async(url)
+    pub async fn connect(config: ClientConfig) -> Result<Self, EventBusError> {
+        let (ws_stream, _) = connect_async(&config.url)
             .await
-            .context("Failed to connect to WebSocket server")?;
+            .map_err(|e| EventBusError::Connection(e.to_string()))?;
         
         let (sender, receiver) = ws_stream.split();
-        Ok(Self { sender, receiver })
+        Ok(Self { sender, receiver, config })
     }
 
-    pub async fn publish(&mut self, topic: &str, payload: &[u8], ttl: Option<i64>) -> Result<()> {
+    async fn reconnect(&mut self) -> Result<(), EventBusError> {
+        let mut retries = 0;
+        loop {
+            match connect_async(&self.config.url).await {
+                Ok((ws_stream, _)) => {
+                    let (sender, receiver) = ws_stream.split();
+                    self.sender = sender;
+                    self.receiver = receiver;
+                    return Ok(());
+                }
+                Err(e) => {
+                    retries += 1;
+                    if retries >= self.config.max_retries {
+                        return Err(EventBusError::Connection(format!("Max retries exceeded: {}", e)));
+                    }
+                    tokio::time::sleep(self.config.reconnect_interval).await;
+                }
+            }
+        }
+    }
+
+    pub async fn publish(&mut self, topic: &str, payload: &str, ttl: Option<i64>) -> Result<(), EventBusError> {
         let publish_msg = json!({
             "type": "publish",
             "data": {
@@ -37,12 +77,12 @@ impl EventBusClient {
         self.sender
             .send(WsMessage::Text(publish_msg.to_string()))
             .await
-            .context("Failed to send publish message")?;
+            .map_err(EventBusError::WebSocket)?;
         
         Ok(())
     }
 
-    pub async fn publish_batch(&mut self, messages: Vec<(String, Vec<u8>)>, ttl: Option<i64>) -> Result<()> {
+    pub async fn publish_batch(&mut self, messages: Vec<(String, String)>, ttl: Option<i64>) -> Result<(), EventBusError> {
         let messages_json = messages.into_iter().map(|(topic, payload)| {
             json!({
                 "topic": topic,
@@ -59,12 +99,12 @@ impl EventBusClient {
         self.sender
             .send(WsMessage::Text(publish_msg.to_string()))
             .await
-            .context("Failed to send publish_batch message")?;
+            .map_err(EventBusError::WebSocket)?;
         
         Ok(())
     }
 
-    pub async fn subscribe(&mut self, pattern: &str, starting_seq: Option<u64>) -> Result<()> {
+    pub async fn subscribe(&mut self, pattern: &str, starting_seq: Option<u64>) -> Result<(), EventBusError> {
         let subscribe_msg = json!({
             "type": "subscribe",
             "pattern": pattern,
@@ -74,12 +114,12 @@ impl EventBusClient {
         self.sender
             .send(WsMessage::Text(subscribe_msg.to_string()))
             .await
-            .context("Failed to send subscribe message")?;
+            .map_err(EventBusError::WebSocket)?;
         
         Ok(())
     }    
 
-    pub async fn acknowledge(&mut self, seq: u64, message_id: Uuid) -> Result<()> {
+    pub async fn acknowledge(&mut self, seq: u64, message_id: Uuid) -> Result<(), EventBusError> {
         let ack_msg = json!({
             "type": "ack",
             "seq": seq,
@@ -89,33 +129,44 @@ impl EventBusClient {
         self.sender
             .send(WsMessage::Text(ack_msg.to_string()))
             .await
-            .context("Failed to send acknowledge message")?;
+            .map_err(EventBusError::WebSocket)?;
         
         Ok(())
     }    
 
-    pub async fn next_message(&mut self) -> Option<Result<CoreMessage>> {
+    pub async fn next_message(&mut self) -> Result<CoreMessage, EventBusError> {
         loop {
             match self.receiver.next().await {
                 Some(Ok(WsMessage::Text(text))) => {
                     match serde_json::from_str::<CoreMessage>(&text) {
-                        Ok(mut msg) => {
-                            // Note: Assuming server sends payload as base64-encoded string in JSON.
-                            // If server sends raw binary in the future, handle WsMessage::Binary here.
-                            return Some(Ok(msg));
-                        }
-                        Err(e) => return Some(Err(anyhow::anyhow!("Failed to parse message: {}", e))),
+                        Ok(msg) => return Ok(msg),
+                        Err(e) => return Err(EventBusError::Serialization(e)),
                     }
                 }
-                Some(Ok(WsMessage::Binary(_))) => {
-                    // Placeholder for future raw binary support if server switches from JSON
-                    eprintln!("Binary messages not yet supported; ignoring");
+                Some(Ok(_)) => continue,
+                Some(Err(e)) => {
+                    self.reconnect().await?;
+                    return Err(EventBusError::WebSocket(e))
+                }
+                None => {
+                    self.reconnect().await?;
                     continue;
                 }
-                Some(Ok(_)) => continue, // Ignore other message types
-                Some(Err(e)) => return Some(Err(e.into())),
-                None => return None,
             }
         }
+    }
+
+    pub fn messages(&mut self) -> MessageIterator<'_> {
+        MessageIterator { client: self }
+    }
+}
+
+pub struct MessageIterator<'a> {
+    client: &'a mut EventBusClient,
+}
+
+impl<'a> MessageIterator<'a> {
+    pub async fn next(&mut self) -> Result<CoreMessage, EventBusError> {
+        self.client.next_message().await
     }
 }
