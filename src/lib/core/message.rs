@@ -1,8 +1,13 @@
 use bytes::Bytes;
 use serde::{Serialize, Deserialize};
+#[cfg(feature = "storage")]
+use sqlx::prelude::FromRow;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg(feature = "storage")]
+#[derive(FromRow )]
+
 pub struct Message {
     pub seq: u64,
     pub message_id: Uuid,

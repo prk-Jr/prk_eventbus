@@ -1,159 +1,191 @@
 use std::sync::Arc;
 use bytes::Bytes;
-use tokio::sync::{Mutex, Semaphore};
-use rusqlite::{Connection, params};
+use tokio::sync::Semaphore;
+use sqlx::{migrate::MigrateDatabase, sqlite::SqlitePoolOptions, Sqlite, SqlitePool};
 use uuid::Uuid;
-use crate::core::Message;
-use crate::storage::Storage;
 use async_trait::async_trait;
 use anyhow::Result;
 
+use crate::core::Message;
+
+use super::Storage;
+
 pub struct SQLiteStorage {
-    conn: Arc<Mutex<Connection>>,
+    pool: SqlitePool,
     semaphore: Arc<Semaphore>,
 }
 
 impl SQLiteStorage {
-    pub fn new(path: &str, max_concurrent_ops: usize) -> Result<Self> {
-        let conn = Connection::open(path)?;
-        conn.execute(
+    pub async fn new(path: &str, max_concurrent_ops: usize) -> Result<Self> {
+        if !Sqlite::database_exists(path).await.unwrap_or(false) {
+            println!("Creating database {}", path);
+            match Sqlite::create_database(path).await {
+                Ok(_) => println!("Create db success"),
+                Err(error) => panic!("error: {}", error),
+            }
+        } else {
+            println!("Database already exists");
+        }
+        Self::migrate(path,max_concurrent_ops).await
+    }
+    pub async fn new_memory(max_concurrent_ops: usize) -> Result<Self> {
+        Self::migrate("sqlite::memory:",max_concurrent_ops).await
+    }
+
+    async fn migrate(path: &str, max_concurrent_ops: usize) -> Result<Self> {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(max_concurrent_ops as u32)
+            .connect(path)
+            .await?;
+
+        // Initialize the database schema
+        sqlx::query(
             "CREATE TABLE IF NOT EXISTS messages (
-                  seq INTEGER PRIMARY KEY AUTOINCREMENT,
-                  topic TEXT,
-                  payload BLOB,
-                  metadata TEXT,
-                  ttl INTEGER,
-                  status TEXT DEFAULT 'pending')
-                  ;
-                ",
-            [],
-        )?;
-        conn.execute(
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                topic TEXT NOT NULL,
+                payload BLOB NOT NULL,
+                metadata TEXT NOT NULL,
+                ttl INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending'
+            )"
+        )
+        .execute(&pool)
+        .await?;
+
+        sqlx::query(
             "CREATE TABLE IF NOT EXISTS processed_messages (
                 message_id TEXT PRIMARY KEY
-            )",
-            [],
-        )?;
+            )"
+        )
+        .execute(&pool)
+        .await?;
+
         Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
+            pool,
             semaphore: Arc::new(Semaphore::new(max_concurrent_ops)),
         })
     }
+
+    // async fn is_message_processed(&self, message_id: Uuid) -> Result<bool> {
+    //     let _permit = self.semaphore.acquire().await?;
+    //     let exists = sqlx::query_scalar::<_, bool>(
+    //         "SELECT EXISTS(SELECT 1 FROM processed_messages WHERE message_id = ?)"
+    //     )
+    //     .bind(message_id.to_string())
+    //     .fetch_one(&self.pool)
+    //     .await?;
+    //     Ok(exists)
+    // }
 }
 
 #[async_trait]
 impl Storage for SQLiteStorage {
     async fn insert_message(&self, msg: &Message, ttl: Option<i64>) -> Result<u64> {
-          self.insert_messages(&[msg.clone()], ttl).await.map(|seqs| seqs[0])
+        self.insert_messages(&[msg.clone()], ttl).await.map(|seqs| seqs[0])
     }
 
     async fn insert_messages(&self, messages: &[Message], ttl: Option<i64>) -> Result<Vec<u64>> {
-        let permit = self.semaphore.acquire().await?;
-        let conn = self.conn.clone();
+        let _permit = self.semaphore.acquire().await?;
         let ttl = ttl.unwrap_or(0);
-        let messages = messages.to_vec();
-        let seqs = tokio::task::spawn_blocking(move || {
-            let mut conn = conn.blocking_lock();
-            let mut seqs = Vec::new();
-            let tx = conn.transaction()?;
-            {
-                let mut stmt = tx.prepare(
-                    "INSERT OR IGNORE INTO messages (message_id, topic, payload, metadata, status, ttl) 
-                 VALUES (?, ?, ?, ?, 'pending', ?)",
-                )?;
-                for msg in &messages {
-                    stmt.execute(params![
-                        msg.topic,
-                        &msg.payload[..],
-                        serde_json::to_string(&msg.metadata)?,
-                        ttl
-                    ])?;
-                    seqs.push(tx.last_insert_rowid() as u64);
-                }
-            }
-            tx.commit()?;
-            Ok::<Vec<u64>, anyhow::Error>(seqs)
-        })
-        .await??;
-    drop(permit);
+        let mut tx = self.pool.begin().await?;
+        let mut seqs = Vec::new();
 
+        for msg in messages {
+            let seq = sqlx::query(
+                "INSERT INTO messages (topic, payload, metadata, ttl, status) 
+                 VALUES (?, ?, ?, ?, 'pending')"
+            )
+            .bind(&msg.topic)
+            .bind(&msg.payload[..])
+            .bind(serde_json::to_string(&msg.metadata)?)
+            .bind(ttl)
+            .execute(&mut *tx)
+            .await?
+            .last_insert_rowid();
+            seqs.push(seq as u64);
+        }
+
+        tx.commit().await?;
         Ok(seqs)
     }
 
-    async fn is_message_processed(&self, message_id: Uuid) -> anyhow::Result<bool> {
-        let permit = self.semaphore.acquire().await?;
-        let conn = self.conn.clone();
-        let is_processed = tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
-            let count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM processed_messages WHERE message_id = ?",
-                params![message_id.to_string()],
-                |row| row.get(0),
-            )?;
-            Ok::<bool, anyhow::Error>(count > 0)
-        })
-        .await??;
-        drop(permit);
-        Ok(is_processed)
+    async fn is_message_processed(&self, message_id: Uuid) -> Result<bool> {
+        let _permit = self.semaphore.acquire().await?;
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM processed_messages WHERE message_id = ?"
+        )
+        .bind(message_id.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count > 0)
     }
 
+    async fn acknowledge_message(&self, seq: u64, message_id: Uuid) -> Result<()> {
+        let _permit = self.semaphore.acquire().await?;
+        let mut tx = self.pool.begin().await?;
 
-    async fn acknowledge_message(&self, seq: u64, message_id: Uuid) -> anyhow::Result<()> {
-        let permit = self.semaphore.acquire().await?;
-        let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
-            conn.execute(
-                "UPDATE messages SET status = 'delivered' WHERE seq = ?",
-                params![seq],
-            )?;
-            conn.execute(
-                "INSERT OR IGNORE INTO processed_messages (message_id) VALUES (?)",
-                params![message_id.to_string()],
-            )?;
-            Ok::<(), anyhow::Error>(())
-        })
-        .await??;
-        drop(permit);
+        sqlx::query(
+            "UPDATE messages SET status = 'delivered' WHERE seq = ?"
+        )
+        .bind(seq as i64)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT OR IGNORE INTO processed_messages (message_id) VALUES (?)"
+        )
+        .bind(message_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
         Ok(())
     }
 
-    async fn get_messages_after(&self, seq: u64, pattern: &str) -> anyhow::Result<Vec<Message>> {
-        let permit = self.semaphore.acquire().await?;
-        let conn = self.conn.clone();
-        let pattern = pattern.to_string();
-        let messages = tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
-            let mut stmt = conn.prepare(
-                "SELECT seq, message_id, topic, payload, metadata 
-                 FROM messages 
-                 WHERE seq > ? AND status = 'pending' 
-                 AND (ttl = 0 OR strftime('%s', 'now') - json_extract(metadata, '$.timestamp') < ttl)",
-            )?;
-            let rows = stmt.query_map([seq], |row| {
-                Ok(Message {
-                    seq: row.get(0)?,
-                    message_id: Uuid::parse_str(&row.get::<_, String>(1)?).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
-                    topic: row.get(2)?,
-                    payload: Bytes::from(row.get::<_, Vec<u8>>(3)?),
-                    metadata: serde_json::from_str(&row.get::<_, String>(4)?).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
-                })
-            })?;
-            let mut messages = Vec::new();
-            for row in rows {
-                let msg = row?;
-                if pattern_matches(&msg.topic, &pattern) {
-                    messages.push(msg);
-                }
-            }
-            Ok::<Vec<Message>, anyhow::Error>(messages)
-        })
-        .await??;
-        drop(permit);
+    async fn get_messages_after(&self, seq: u64, pattern: &str) -> Result<Vec<Message>> {
+        let _permit = self.semaphore.acquire().await?;
+        let rows = sqlx::query_as::<_, MessageRow>(
+            "SELECT seq, message_id, topic, payload, metadata 
+             FROM messages 
+             WHERE seq >= ? AND status = 'pending' 
+             AND (ttl = 0 OR strftime('%s', 'now') - CAST(json_extract(metadata, '$.timestamp') AS INTEGER) < ttl)"
+        )
+        .bind(seq as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        
+    
+        let messages = rows.into_iter()
+            .filter(|row| pattern_matches(&row.topic, pattern))
+            .map(|row| row.into_message())
+            .collect::<Result<Vec<_>>>()?;
         Ok(messages)
     }
 }
 
+// Helper struct for SQLx row mapping
+#[derive(sqlx::FromRow)]
+struct MessageRow {
+    seq: i64,
+    message_id: String,
+    topic: String,
+    payload: Vec<u8>,
+    metadata: String,
+}
+
+impl MessageRow {
+    fn into_message(self) -> Result<Message> {
+        Ok(Message {
+            seq: self.seq as u64,
+            message_id: Uuid::parse_str(&self.message_id)?,
+            topic: self.topic,
+            payload: Bytes::from(self.payload),
+            metadata: serde_json::from_str(&self.metadata)?,
+        })
+    }
+}
+
+// Same pattern matching logic as your original
 fn pattern_matches(topic: &str, pattern: &str) -> bool {
     let topic_segments = topic.split('.').collect::<Vec<_>>();
     let pattern_segments = pattern.split('.').collect::<Vec<_>>();

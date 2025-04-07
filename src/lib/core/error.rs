@@ -14,8 +14,12 @@ pub enum EventBusError {
     IoError(#[from] io::Error),
     #[error("IO Error: {0}")]
     Connection(String),
-    #[error("Invalid message format")]
-    InvalidMessage,
+    #[error("Invalid message format: {0}")]
+    InvalidMessage(String),
     #[error("Channel closed")]
     ChannelClosed,
+    #[error("Not Implemented")]
+    NotImplemented,
+    #[error("Timeout error")]
+    Timeout,
 }

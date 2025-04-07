@@ -4,3 +4,5 @@ pub mod client;
 pub mod storage;
 pub mod transport;
 
+#[cfg(test)]
+pub mod tests;

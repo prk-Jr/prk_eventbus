@@ -7,17 +7,21 @@ use axum::{
     routing::get,
     Router,
 };
-use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::sync::{broadcast, Mutex};
 use crate::{core::{EventBus, Message as CoreMessage}, transport::Transport, core::error::EventBusError};
 use crate::storage::Storage;
+use uuid::Uuid;
+use serde_json::Value;
+
+#[cfg(feature = "tracing")]
+use tracing::{info, debug, instrument, warn};
 
 #[derive(Clone)]
 pub struct WsConfig {
-    pub channel_capacity: usize, // Capacity for mpsc channel
-    pub auto_ack: bool,          // Whether to auto-acknowledge messages
+    pub channel_capacity: usize,
+    pub auto_ack: bool,
 }
 
 impl Default for WsConfig {
@@ -32,31 +36,24 @@ impl Default for WsConfig {
 pub struct WsTransport<S: Storage + Send + Sync + 'static> {
     storage: Option<Arc<S>>,
     bus: Arc<EventBus<S>>,
-    receiver_tx: mpsc::Sender<CoreMessage>,
-    receiver_rx: Arc<Mutex<mpsc::Receiver<CoreMessage>>>,
 }
 
 impl<S: Storage + Send + Sync + 'static> WsTransport<S> {
     pub fn new(storage: Option<Arc<S>>, config: WsConfig) -> Self {
         let bus = Arc::new(EventBus::new(storage.clone(), config.auto_ack));
-        let (receiver_tx, receiver_rx) = mpsc::channel(config.channel_capacity);
-        Self {
-            storage,
-            bus,
-            receiver_tx,
-            receiver_rx: Arc::new(Mutex::new(receiver_rx)),
-        }
+        Self { storage, bus }
     }
 
     pub async fn serve(&self, addr: &str) -> Result<(), EventBusError> {
         let storage = self.storage.clone();
         let bus = self.bus.clone();
-        let receiver_tx = self.receiver_tx.clone();
         let app = Router::new().route("/ws", get({
             let storage = storage.clone();
-            move |ws| Self::handle_ws(ws, bus.clone(), storage.clone(), receiver_tx.clone())
+            move |ws| Self::handle_ws(ws, bus.clone(), storage.clone())
         }));
         let listener = tokio::net::TcpListener::bind(addr).await?;
+        #[cfg(feature = "tracing")]
+        info!(addr = %addr, "WebSocket server started");
         axum::serve(listener, app).await?;
         Ok(())
     }
@@ -65,100 +62,146 @@ impl<S: Storage + Send + Sync + 'static> WsTransport<S> {
         ws: WebSocketUpgrade,
         bus: Arc<EventBus<S>>,
         storage: Option<Arc<S>>,
-        receiver_tx: mpsc::Sender<CoreMessage>,
     ) -> Response {
-        ws.on_upgrade(move |socket| Self::handle_connection(socket, bus, storage, receiver_tx))
+        ws.on_upgrade(move |socket| Self::handle_connection(socket, bus, storage))
     }
 
+    #[cfg_attr(feature = "tracing", instrument(skip(bus, storage, data, ttl)))]
+async fn handle_publish(
+    bus: &Arc<EventBus<S>>,
+    storage: &Option<Arc<S>>,
+    data: Value,
+    ttl: Option<i64>,
+) -> Result<(), EventBusError> {
+    let topic = data.get("topic")
+        .and_then(Value::as_str)
+        .ok_or_else(|| EventBusError::InvalidMessage("Missing topic".into()))?;
+    let payload = data.get("payload")
+        .and_then(Value::as_str)
+        .ok_or_else(|| EventBusError::InvalidMessage("Missing payload".into()))?;
+    let message_id = data.get("message_id")
+        .and_then(Value::as_str)
+        .map(|id| Uuid::parse_str(id).unwrap_or_else(|_| Uuid::new_v4()))
+        .unwrap_or_else(Uuid::new_v4);
+
+    #[cfg(feature = "tracing")]
+    debug!(topic = %topic, payload = %payload, message_id = %message_id, "Processing publish request");
+
+    if let Some(storage) = storage {
+        if storage.is_message_processed(message_id).await? {
+            #[cfg(feature = "tracing")]
+            debug!(message_id = %message_id, "Skipping duplicate message");
+            return Ok(());
+        }
+    }
+
+    let payload_bytes = payload.to_string().into_bytes();
+    bus.publish(topic, message_id,  payload_bytes, ttl).await?;
+
+    #[cfg(feature = "tracing")]
+    debug!(topic = %topic, message_id = %message_id, "Message published successfully");
+    Ok(())
+}
+
+    #[cfg_attr(feature = "tracing", instrument(skip(socket, bus, storage)))]
     async fn handle_connection(
         socket: WebSocket,
         bus: Arc<EventBus<S>>,
         storage: Option<Arc<S>>,
-        receiver_tx: mpsc::Sender<CoreMessage>,
     ) {
         let (sender, mut receiver) = socket.split();
         let sender = Arc::new(Mutex::new(sender));
 
-        while let Some(Ok(msg)) = receiver.next().await {
+        #[cfg(feature = "tracing")]
+        info!("New WebSocket connection established");
+
+        while let Some(msg) = receiver.next().await {
             match msg {
-                AxumMessage::Text(text) => {
-                    if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) {
-                        match ws_msg {
-                            WsMessage::Subscribe { pattern, starting_seq } => {
-                                let rx = bus.subscribe(&pattern, starting_seq).await;
-                                let sender_clone = Arc::clone(&sender);
-                                let storage_clone = storage.clone();
-                                tokio::spawn(async move {
-                                    let mut sender_lock = sender_clone.lock().await;
-                                    Self::forward_messages(rx, &mut *sender_lock, storage_clone).await;
-                                });
-                            }
-                            WsMessage::Publish { data, ttl } => {
-                                let payload = Bytes::copy_from_slice( &data.payload.into_bytes());
-                                let message = CoreMessage {
-                                    seq: 0,
-                                    message_id: uuid::Uuid::new_v4(),
-                                    topic: data.topic.clone(),
-                                    payload,
-                                    metadata: crate::core::Metadata {
-                                        timestamp: chrono::Utc::now().timestamp_millis(),
-                                        content_type: "text/plain".to_string(),
-                                    },
-                                };
-                                let _ = bus.publish(&data.topic, message.payload.to_vec(), ttl).await;
-                                let _ = receiver_tx.send(message).await;
-                            }
-                            WsMessage::Acknowledge { seq, message_id } => {
-                                if let Some(storage) = &storage {
-                                    if let Err(e) = storage.acknowledge_message(seq, message_id).await {
-                                        eprintln!("Failed to acknowledge message {}: {}", seq, e);
+                Ok(AxumMessage::Text(text)) => {
+                    #[cfg(feature = "tracing")]
+                    debug!(message = %text, "Received WebSocket message");
+                    match serde_json::from_str::<WsMessage>(&text) {
+                        Ok(ws_msg) => {
+                            match ws_msg {
+                                WsMessage::Subscribe { pattern, starting_seq } => {
+                                    #[cfg(feature = "tracing")]
+                                    debug!(pattern = %pattern, starting_seq = ?starting_seq, "Processing subscribe");
+                                    let rx = bus.subscribe(&pattern, starting_seq).await;
+                                    let sender_clone = Arc::clone(&sender);
+                                    tokio::spawn(async move {
+                                        let mut sender_lock = sender_clone.lock().await;
+                                        Self::forward_messages(rx, &mut *sender_lock).await;
+                                    });
+                                }
+                                WsMessage::Publish { data, ttl } => {
+                                    if let Err(e) = Self::handle_publish(&bus, &storage, serde_json::to_value(data).unwrap(), ttl).await {
+                                        #[cfg(feature = "tracing")]
+                                        warn!(error = %e, "Failed to handle publish");
+                                    }
+                                }
+                                WsMessage::Acknowledge { seq, message_id } => {
+                                    #[cfg(feature = "tracing")]
+                                    debug!(seq = seq, message_id = %message_id, "Received acknowledge");
+                                    if let Some(storage) = &storage {
+                                        if let Err(e) = storage.acknowledge_message(seq, message_id).await {
+                                            eprintln!("Failed to acknowledge message {}: {}", seq, e);
+                                        }
+                                        #[cfg(feature = "tracing")]
+                                        debug!(seq = seq, message_id = %message_id, "Acknowledged message");
+                                    }
+                                }
+                                WsMessage::PublishBulk { messages, ttl } => {
+                                    #[cfg(feature = "tracing")]
+                                    debug!(count = messages.len(), "Received publish_batch");
+                                    let mut msgs = Vec::new();
+                                    for m in messages {
+                                        let payload = m.payload.into_bytes();
+                                        msgs.push((m.topic.clone(), payload));
+                                    }
+                                    if let Err(e) = bus.publish_batch(msgs, ttl).await {
+                                        #[cfg(feature = "tracing")]
+                                        warn!(error = %e, "Failed to publish batch");
                                     }
                                 }
                             }
-                            WsMessage::PublishBulk { messages, ttl } => {
-                                let mut msgs = Vec::new();
-                                let mut core_messages = Vec::new();
-                                for m in messages {
-                                    let payload = m.payload.into_bytes();
-                                    msgs.push((m.topic.clone(), payload.clone()));
-                                let payload = Bytes::copy_from_slice( &payload);
-
-                                    core_messages.push(CoreMessage {
-                                        seq: 0,
-                                        message_id: uuid::Uuid::new_v4(),
-                                        topic: m.topic,
-                                        payload,
-                                        metadata: crate::core::Metadata {
-                                            timestamp: chrono::Utc::now().timestamp_millis(),
-                                            content_type: "text/plain".to_string(),
-                                        },
-                                    });
-                                }
-                                let _ = bus.publish_batch(msgs, ttl).await;
-                                for msg in core_messages {
-                                    let _ = receiver_tx.send(msg).await;
-                                }
-                            }
+                        }
+                        Err(e) => {
+                            #[cfg(feature = "tracing")]
+                            warn!(error = %e, message = %text, "Failed to deserialize WebSocket message");
                         }
                     }
                 }
-                AxumMessage::Close(_) => break,
-                _ => continue,
+                Ok(AxumMessage::Close(_)) => {
+                    #[cfg(feature = "tracing")]
+                    info!("WebSocket connection closed");
+                    break;
+                }
+                Ok(_) => continue,
+                Err(e) => {
+                    #[cfg(feature = "tracing")]
+                    warn!(error = %e, "WebSocket message error");
+                    break;
+                }
             }
         }
     }
 
+    #[cfg_attr(feature = "tracing", instrument(skip(rx, sender)))]
     async fn forward_messages(
         mut rx: broadcast::Receiver<CoreMessage>,
         sender: &mut (impl SinkExt<AxumMessage> + Unpin),
-        storage: Option<Arc<S>>,
     ) {
         while let Ok(msg) = rx.recv().await {
+            #[cfg(feature = "tracing")]
+            debug!(topic = %msg.topic, message_id = %msg.message_id, "Received message for forwarding");
             if let Ok(json_msg) = serde_json::to_string(&msg) {
-                let _ = sender.send(AxumMessage::Text(json_msg.into())).await;
-                if storage.is_none() {
-                    eprintln!("Storage not provided; skipping ack for message {}", msg.seq);
+                if let Err(e) = sender.send(AxumMessage::Text(json_msg.into())).await {
+                    #[cfg(feature = "tracing")]
+                    warn!(target: "forward_messages", "Failed to send message to subscriber");
+                    break;
                 }
+                #[cfg(feature = "tracing")]
+                debug!(topic = %msg.topic, message_id = %msg.message_id, "Forwarded message to subscriber");
             }
         }
     }
@@ -167,7 +210,7 @@ impl<S: Storage + Send + Sync + 'static> WsTransport<S> {
 #[async_trait::async_trait]
 impl<S: Storage + Send + Sync + 'static> Transport for WsTransport<S> {
     async fn send(&self, message: CoreMessage, ttl: Option<i64>) -> Result<(), EventBusError> {
-        self.bus.publish(&message.topic, message.payload.to_vec(), ttl).await?;
+        self.bus.publish(&message.topic,message.message_id ,message.payload.to_vec(), ttl).await?;
         Ok(())
     }
 
@@ -194,24 +237,27 @@ impl<S: Storage + Send + Sync + 'static> Transport for WsTransport<S> {
     }
 
     async fn receive(&self) -> Result<CoreMessage, EventBusError> {
-        let mut rx = self.receiver_rx.lock().await;
-        rx.recv()
-            .await
-            .ok_or(EventBusError::ChannelClosed)
+        Err(EventBusError::NotImplemented)
     }
 }
 
 #[derive(serde::Deserialize)]
 #[serde(tag = "type")]
 enum WsMessage {
+    #[serde(rename = "subscribe")]
     Subscribe { pattern: String, starting_seq: Option<u64> },
+    #[serde(rename = "publish")]
     Publish { data: PublishArgs, ttl: Option<i64> },
+    #[serde(rename = "publish_batch")]
     PublishBulk { messages: Vec<PublishArgs>, ttl: Option<i64> },
+    #[serde(rename = "ack")]
     Acknowledge { seq: u64, message_id: uuid::Uuid },
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, serde::Serialize)]
 struct PublishArgs {
     topic: String,
     payload: String,
+    #[serde(default)]
+    message_id: Option<String>,
 }
