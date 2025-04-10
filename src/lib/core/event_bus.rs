@@ -142,6 +142,7 @@ impl<S: Storage + Send + Sync + 'static> EventBus<S> {
                     for msg in messages {
                         // Skip already processed messages
                         if let Ok(true) = storage.is_message_processed(msg.message_id).await {
+                            #[cfg(feature = "tracing")]
                             tracing::info!("Duplicate message {} detected, skipping publish", msg.message_id);
                             continue;
                         }else {
