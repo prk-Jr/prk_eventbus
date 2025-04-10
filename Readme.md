@@ -22,7 +22,7 @@ The **Event Bus Service** is a versatile, WebSocket-based event bus built in Rus
 ## Installation
 1. **Clone the Repository**:
    ```bash
-   git clone https://github.com/yourusername/prk_eventbus.git
+   git clone https://github.com/prk-Jr/prk_eventbus.git
    cd prk_eventbus
    ```
 

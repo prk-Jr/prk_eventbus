@@ -1,6 +1,6 @@
 [package]
 name = "prk_eventbus"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A lightweight, WebSocket-based event bus for Rust with SQLite persistence"
 license = "MIT"  
