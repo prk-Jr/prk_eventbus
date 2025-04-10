@@ -1,6 +1,6 @@
-use rust_eventbus::adapters::websocket::WsTransport;
-use rust_eventbus::adapters::WsConfig;
-use rust_eventbus::storage::sqlite::SQLiteStorage;
+use prk_eventbus::adapters::websocket::WsTransport;
+use prk_eventbus::adapters::WsConfig;
+use prk_eventbus::storage::sqlite::SQLiteStorage;
 use std::sync::Arc;
 
 #[tokio::main]

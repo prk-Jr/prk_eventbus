@@ -44,6 +44,15 @@ impl<S: Storage + Send + Sync + 'static> WsTransport<S> {
         Self { storage, bus }
     }
 
+    pub fn axum_router<T: Clone + Sync + Send + 'static>(&self, state: T) -> Router<T> {
+        let storage = self.storage.clone();
+        let bus = self.bus.clone();
+        Router::new().route("/ws", get({
+            let storage = storage.clone();
+            move |ws| Self::handle_ws(ws, bus.clone(), storage.clone())
+        })).with_state(state)
+    }
+
     pub async fn serve(&self, addr: &str) -> Result<(), EventBusError> {
         let storage = self.storage.clone();
         let bus = self.bus.clone();

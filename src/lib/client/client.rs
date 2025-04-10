@@ -50,7 +50,7 @@ impl EventBusClient {
     }
 
     #[cfg_attr(feature = "tracing", instrument(skip(config)))]
-    pub async fn connect_with_retry(config: ClientConfig) -> Result<EventBusClient, Box<dyn std::error::Error>> {
+    pub async fn connect_with_retry(config: ClientConfig) -> Result<EventBusClient, EventBusError> {
         let mut retries = config.max_retries;
         while retries > 0 {
             match EventBusClient::connect(config.clone()).await {
@@ -61,7 +61,7 @@ impl EventBusClient {
                 }
             }
         }
-        Err("Failed to connect after retries".into())
+        Err(EventBusError::Unknown("Failed to connect after retries".to_string()))
     }
 
     #[cfg_attr(feature = "tracing", instrument(skip(self)))]

@@ -22,4 +22,6 @@ pub enum EventBusError {
     NotImplemented,
     #[error("Timeout error")]
     Timeout,
+    #[error("Unknown error {0}")]
+    Unknown(String),
 }

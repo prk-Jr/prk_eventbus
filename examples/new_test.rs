@@ -1,5 +1,5 @@
 use std::time::Duration;
-use rust_eventbus::{
+use prk_eventbus::{
     adapters::{WsConfig, WsTransport},
     client::{ClientConfig, EventBusClient},
     core::error::EventBusError,

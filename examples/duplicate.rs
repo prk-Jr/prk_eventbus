@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use rust_eventbus::{
+use prk_eventbus::{
     adapters::{WsConfig, WsTransport},
     client::{ClientConfig, EventBusClient},
     storage::sqlite::SQLiteStorage,

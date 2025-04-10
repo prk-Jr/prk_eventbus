@@ -1,10 +1,10 @@
 [package]
-name = "rust_eventbus"
+name = "prk_eventbus"
 version = "0.1.0"
 edition = "2024"
 
 [lib]
-name = "rust_eventbus"
+name = "prk_eventbus"
 path = "src/lib/lib.rs"
 
 [[bin]]

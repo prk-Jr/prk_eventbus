@@ -1,5 +1,5 @@
 use std::time::Duration;
-use rust_eventbus::{adapters::{WsConfig, WsTransport}, client::{ClientConfig, EventBusClient}, core::error::EventBusError, storage::sqlite::SQLiteStorage};
+use prk_eventbus::{adapters::{WsConfig, WsTransport}, client::{ClientConfig, EventBusClient}, core::error::EventBusError, storage::dummy_storage::NoStorage};
 use tokio::task::JoinHandle;
 
 #[tokio::main]
@@ -13,10 +13,10 @@ async fn main() -> Result<(), EventBusError> {
 
     let server_handle: JoinHandle<()> = tokio::spawn(async {
         let ws_config = WsConfig {
-            channel_capacity: 1000, // Increased capacity
+            channel_capacity: 1000,
             auto_ack: true,
         };
-        let transport: WsTransport<SQLiteStorage> = WsTransport::new(None, ws_config);
+        let transport: WsTransport<NoStorage> = WsTransport::new(None, ws_config);
         transport.serve("127.0.0.1:3000").await.unwrap();
     });
 
@@ -44,7 +44,7 @@ async fn main() -> Result<(), EventBusError> {
                     let payload = String::from_utf8_lossy(&msg.payload);
                     #[cfg(feature = "tracing")]
                     if received % 100 == 0 {
-                        tracing::info!(received = received, "Subscriber received message");
+                        tracing::info!(received = received, "Subscriber received message: {}", payload);
                     }
                     subscriber.acknowledge(msg.seq, msg.message_id).await?;
                     received += 1;
@@ -62,9 +62,8 @@ async fn main() -> Result<(), EventBusError> {
         Ok(())
     });
 
-    // Publish 1000 messages
     for i in 0..1000 {
-        publisher.publish("chat.stress", &format!("Stress message {}", i),None, Some(3600)).await?;
+        publisher.publish("chat.stress", &format!("Stress message {}", i), None, Some(3600)).await?;
     }
 
     tokio::time::sleep(Duration::from_secs(5)).await;

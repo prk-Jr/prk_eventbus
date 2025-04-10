@@ -5,9 +5,7 @@ use sqlx::prelude::FromRow;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg(feature = "storage")]
-#[derive(FromRow )]
-
+#[cfg_attr(feature = "storage", derive(FromRow))]
 pub struct Message {
     pub seq: u64,
     pub message_id: Uuid,
@@ -15,6 +13,7 @@ pub struct Message {
     pub payload: Bytes, 
     pub metadata: Metadata,
 }
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Metadata {

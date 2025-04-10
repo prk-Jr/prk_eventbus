@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use bytes::Bytes;
 use tokio::sync::Semaphore;
+#[cfg(feature = "storage")]
 use sqlx::{migrate::MigrateDatabase, sqlite::SqlitePoolOptions, Sqlite, SqlitePool};
 use uuid::Uuid;
 use async_trait::async_trait;
@@ -11,10 +12,12 @@ use crate::core::Message;
 use super::Storage;
 
 pub struct SQLiteStorage {
+    #[cfg(feature = "storage")]
     pool: SqlitePool,
     semaphore: Arc<Semaphore>,
 }
 
+#[cfg(feature = "storage")]
 impl SQLiteStorage {
     pub async fn new(path: &str, max_concurrent_ops: usize) -> Result<Self> {
         if !Sqlite::database_exists(path).await.unwrap_or(false) {
@@ -78,6 +81,7 @@ impl SQLiteStorage {
     // }
 }
 
+#[cfg(feature = "storage")]
 #[async_trait]
 impl Storage for SQLiteStorage {
     async fn insert_message(&self, msg: &Message, ttl: Option<i64>) -> Result<u64> {
@@ -164,7 +168,8 @@ impl Storage for SQLiteStorage {
 }
 
 // Helper struct for SQLx row mapping
-#[derive(sqlx::FromRow)]
+
+#[cfg_attr(feature = "storage", derive(sqlx::FromRow))]
 struct MessageRow {
     seq: i64,
     message_id: String,
@@ -173,6 +178,7 @@ struct MessageRow {
     metadata: String,
 }
 
+#[cfg(feature = "storage")]
 impl MessageRow {
     fn into_message(self) -> Result<Message> {
         Ok(Message {

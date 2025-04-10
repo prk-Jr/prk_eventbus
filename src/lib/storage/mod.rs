@@ -1,4 +1,6 @@
+#[cfg(feature = "storage")]
 pub mod sqlite;
+pub mod dummy_storage;
 
 use async_trait::async_trait;
 use uuid::Uuid;
