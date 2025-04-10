@@ -2,6 +2,13 @@
 name = "prk_eventbus"
 version = "0.1.0"
 edition = "2024"
+description = "A lightweight, WebSocket-based event bus for Rust with SQLite persistence"
+license = "MIT"  
+repository = "https://github.com/prk-Jr/prk_eventbus"  
+homepage = "https://github.com/prk-Jr/prk_eventbus"
+keywords = ["event-bus", "websocket", "microservices", "axum", "sqlite"]
+categories = ["asynchronous", "network-programming", "database"]
+readme = "Readme.md"
 
 [lib]
 name = "prk_eventbus"
