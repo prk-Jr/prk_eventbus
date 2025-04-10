@@ -14,9 +14,9 @@ readme = "Readme.md"
 name = "prk_eventbus"
 path = "src/lib/lib.rs"
 
-[[bin]]
-name = "server"
-path = "src/server/main.rs"
+# [[bin]]
+# name = "server"
+# path = "src/server/main.rs"
 
 [dependencies]
 tokio = { version = "1.0", features = ["full"] }
